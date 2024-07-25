@@ -1,34 +1,54 @@
-import port.api.props as props
-from port.api.commands import (CommandSystemDonate, CommandUIRender, CommandSystemExit)
+import logging
+import json
+import io
 
 import pandas as pd
-import zipfile
+
+import port.api.props as props
+import port.mastodon as mastodon
+from port.api.commands import (CommandSystemDonate, CommandUIRender, CommandSystemExit)
+
+
+LOG_STREAM = io.StringIO()
+
+logging.basicConfig(
+    stream=LOG_STREAM,
+    level=logging.INFO,
+    format="%(asctime)s --- %(name)s --- %(levelname)s --- %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z",
+)
+
+LOGGER = logging.getLogger("script")
 
 def process(session_id: str):
-    platform = "Platform of interest"
+    platform = "Mastodon"
 
     # Start of the data donation flow
     while True:
+        LOGGER.info("Prompt for file for %s", platform)
+        yield donate_logs(f"{session_id}-tracking")
+
         # Ask the participant to submit a file
-        file_prompt = generate_file_prompt(platform, "application/zip, text/plain")
+        file_prompt = generate_file_prompt(platform, "application/zip")
         file_prompt_result = yield render_page(platform, file_prompt)
 
         # If the participant submitted a file: continue
         if file_prompt_result.__type__ == 'PayloadString':
 
             # Validate the file the participant submitted
-            # In general this is wise to do 
-            is_data_valid = validate_the_participants_input(file_prompt_result.value)
+            validation = mastodon.validate_zip(file_prompt_result.value)
 
             # Happy flow:
             # The file the participant submitted is valid
-            if is_data_valid == True:
+            if validation.status_code.id == 0:
+                LOGGER.info("Payload for %s", platform)
+                yield donate_logs(f"{session_id}-tracking")
 
                 # Extract the data you as a researcher are interested in, and put it in a pandas DataFrame
                 # Show this data to the participant in a table on screen
                 # The participant can now decide to donate
-                extracted_data = extract_the_data_you_are_interested_in(file_prompt_result.value)
-                consent_prompt = generate_consent_prompt(extracted_data)
+                tables = extract_mastodon(file_prompt_result.value)
+                consent_prompt = generate_consent_prompt(tables)
                 consent_prompt_result = yield render_page(platform, consent_prompt)
 
                 # If the participant wants to donate the data gets donated
@@ -39,7 +59,7 @@ def process(session_id: str):
 
             # Sad flow:
             # The data was not valid, ask the participant to retry
-            if is_data_valid == False:
+            if validation.status_code.id != 0:
                 retry_prompt = generate_retry_prompt(platform)
                 retry_prompt_result = yield render_page(platform, retry_prompt)
 
@@ -58,50 +78,31 @@ def process(session_id: str):
     yield render_end_page()
 
 
-def extract_the_data_you_are_interested_in(zip_file: str) -> pd.DataFrame:
-    """
-    This function extracts the data the researcher is interested in
+def donate_logs(key):
+    log_string = LOG_STREAM.getvalue()  # read the log stream
+    if log_string:
+        log_data = log_string.split("\n")
+    else:
+        log_data = ["no logs"]
 
-    In this case we extract from the zipfile:
-    * The file names
-    * The compressed file size
-    * The file size
-
-    You could extract anything here
-    """
-    out = pd.DataFrame()
-
-    try:
-        file = zipfile.ZipFile(zip_file)
-        data = []
-        for name in file.namelist():
-            info = file.getinfo(name)
-            data.append((name, info.compress_size, info.file_size))
-
-        out = pd.DataFrame(data, columns=["File name", "Compressed file size", "File size"])
-
-    except Exception as e:
-        print(f"Something went wrong: {e}")
-
-    return out
+    return donate(key, json.dumps(log_data))
 
 
-def validate_the_participants_input(zip_file: str) -> bool:
-    """
-    Check if the participant actually submitted a zipfile
-    Returns True if participant submitted a zipfile, otherwise False
+def extract_mastodon(mastodon_zip: str) -> list[props.PropsUIPromptConsentFormTable]:
+    
+    tables = []
 
-    In reality you need to do a lot more validation.
-    Some things you could check:
-    - Check if the the file(s) are the correct format (json, html, binary, etc.)
-    - If the files are in the correct language
-    """
+    df = mastodon.likes_to_df(mastodon_zip)
+    if not df.empty:
+        table_title = props.Translatable({"en": "Your likes on Mastodon", "nl": "Uw likes op Mastodon"})
+        table_description = props.Translatable({
+            "en": "Table description", 
+            "nl": "Table description"
+        })
 
-    try:
-        with zipfile.ZipFile(zip_file) as zf:
-            return True
-    except zipfile.BadZipFile:
-        return False
+        tables.append(props.PropsUIPromptConsentFormTable("mastodon_likes", table_title, df, table_description))
+
+    return tables
 
 
 def render_end_page():
@@ -146,9 +147,9 @@ def generate_file_prompt(platform, extensions) -> props.PropsUIPromptFileInput:
     return props.PropsUIPromptFileInput(description, extensions)
 
 
-def generate_consent_prompt(*args: pd.DataFrame) -> props.PropsUIPromptConsentForm:
+def generate_consent_prompt(tables: list) -> props.PropsUIPromptConsentForm:
     description = props.Translatable({
-       "en": "Below you will find meta data about the contents of the zip file you submitted. Please review the data carefully and remove any information you do not wish to share. If you would like to share this data, click on the 'Yes, share for research' button at the bottom of this page. By sharing this data, you contribute to research <insert short explanation about your research here>.",
+       "en": "Below you will find meta data about the contents of the zip file you submitted. Please review the data carefully and remove any information you do not wish to share. If you would like to share this data, click on the 'Yes, share for research' button at the bottom of this page. By sharing this data, you contribute to research about social media likes.",
        "nl": "Hieronder ziet u gegevens over de zip die u heeft ingediend. Bekijk de gegevens zorgvuldig, en verwijder de gegevens die u niet wilt delen. Als u deze gegevens wilt delen, klik dan op de knop 'Ja, deel voor onderzoek' onderaan deze pagina. Door deze gegevens te delen draagt u bij aan onderzoek over <korte zin over het onderzoek>."
     })
 
@@ -161,14 +162,6 @@ def generate_consent_prompt(*args: pd.DataFrame) -> props.PropsUIPromptConsentFo
        "en": "Yes, share for research",
        "nl": "Ja, deel voor onderzoek"
     })
-
-    tables = [] 
-    for index, df in enumerate(args):
-        table_title = props.Translatable({
-            "en": f"The contents of your zipfile contents (Table {index + 1}/{len(args)})",
-            "nl": "De inhoud van uw zip bestand"
-        })
-        tables.append(props.PropsUIPromptConsentFormTable(f"zip_contents_{index}", table_title, df))
 
     return props.PropsUIPromptConsentForm(
        tables,
